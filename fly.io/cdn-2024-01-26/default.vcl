@@ -8,9 +8,9 @@ import std;
 # - https://abhishekjakhotiya.medium.com/magento-internals-cache-purging-and-cache-tags-bf7772e60797
 
 backend default {
-  .host = "top1.nearest.of.changelog-2024-01-12.internal";
+  .host = "pipedream.changelog.com";
   .host_header = "changelog-2024-01-12.fly.dev";
-  .port = "4000";
+  .port = "80";
   .first_byte_timeout = 5s;
   .probe = {
     .url = "/health";
@@ -49,6 +49,10 @@ sub vcl_backend_response {
   }
 
   # 🤔 QUESTION: Should we configure beresp.keep?
+
+  # Add extra object property (ban lurker friendly)
+  set beresp.http.url = bereq.url;
+
 }
 
 # NOTE: vcl_recv is called at the beginning of a request, after the complete
@@ -58,6 +62,19 @@ sub vcl_recv {
   # https://varnish-cache.org/docs/7.4/users-guide/purging.html
   if (req.method == "PURGE") {
     return (purge);
+  }
+
+  # Use a RegEx for banning objects (ban lurker friendly)
+  # 🥸 You can read more about the creepy ban lurker, find it's age, and when it sleeps.
+  # https://www.varnish-software.com/developers/tutorials/ban/
+  if (req.method == "BANREGEX") {
+    # Assumes req.url is a regex. This might be a bit too simple
+    if (std.ban("obj.http.url ~ " + req.http.BanRegexValue)) {
+            return(synth(200, "Ban added"));
+    } else {
+            # return ban error in 400 response
+            return(synth(400, std.ban_error()));
+    }
   }
 
   # Implement a Varnish health-check
@@ -88,6 +105,9 @@ sub vcl_deliver {
 
   # How many times has this response been served from Varnish?
   set resp.http.x-cache-hits = obj.hits;
+
+  # Remove the extra object property (ban lurker friendly)
+  unset resp.http.url;
 }
 
 # TODOS:
