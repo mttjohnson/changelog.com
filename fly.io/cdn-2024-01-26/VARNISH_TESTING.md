@@ -143,3 +143,100 @@ sub vcl_recv {
   }
 }
 ```
+
+## Dynamic DNS Backends
+
+If the DNS address of the backend resolves to different IPs over time as backends are redeployed we may need something that will update the resolved IP to the DNS address for the backends. It looks like if a hostname is specified in the standard VCL backend, any changes to that hostname will only be picked up if the VCL is reloaded.
+
+https://info.varnish-software.com/blog/two-minutes-tech-tuesdays-dynamic-backend
+
+I found a vmod called ActiveDNS (https://docs.varnish-software.com/varnish-enterprise/vmods/activedns/), that looks to do this, but that is only available to Varnish Enterprise version. Thankfully it also appears there is an open source licensed vmods (dynamic) that perform similar capabilites.
+
+https://varnish-cache.org/vmods/
+dynamic https://raw.githubusercontent.com/nigoroll/libvmod-dynamic/master/src/vmod_dynamic.vcc
+
+That ends up leading to how do you get a vmod into the docker container as this is an additional module on top of Varnish that extends the capabilities of Varnish. From a few searches people talk about this being a bit mroe complicated.
+
+https://info.varnish-software.com/blog/varnish-modules-vmods-overview
+https://github.com/varnish/docker-varnish/tree/master/vmod-examples
+
+Whiel starting to dig into what is involved in this I noticed some similarities to what I was seeing in the dcoker container history and realized the dynamic vmod is already installed in the official varnish docker container image we are using, and is mentioned on the docker hub page as well (https://hub.docker.com/_/varnish). 😅
+
+The documentation and examples on actually using this vmod_dynamic seems a bit lacking, but I did find a few resources besides the `vmod_dynamic.vcc` file that helped provide a little guidance to piece some of the things together.
+https://knplabs.com/en/blog/how2tip-varnish-dynamic-backend-dns-resolution-in-a-docker-swarm-context/
+https://medium.com/@archonkulis/varnish-resolves-backend-ip-only-at-launch-time-64b4c103daed
+
+```vcl
+import dynamic;
+
+probe backend_probe {
+  .url = "/health";
+  .timeout = 2s;
+  .interval = 5s;
+  .window = 10;
+  .threshold = 5;
+}
+
+backend default {
+  .host = "pipedream.changelog.com"; # I think this needs a valid value but isn't used ?
+}
+
+sub vcl_init {
+  new ddir = dynamic.director(
+    ttl = 10s, # the hostname will be resolved every 60 seconds
+
+    # host = "pipedream.changelog.com", # host is defined in vcl_recv call to ddir.backend()
+    host_header = "changelog-2024-01-12.fly.dev",
+    port = "80",
+    first_byte_timeout = 5s,
+    probe = backend_probe,
+    );
+}
+
+sub vcl_recv {
+  # use dynamic backend instead of default
+  set req.backend_hint = ddir.backend("pipedream.changelog.com");
+}
+```
+
+Monitoring vmod-dynamic with varnishlog
+```bash
+varnishlog -g raw -q '* ~ vmod-dynamic'
+```
+```
+         0 Timestamp      - vmod-dynamic varnish_1719685879.ddir(pipedream.changelog.com:80) Lookup: 1719687145.378702 0.000000 0.000000
+         0 Timestamp      - vmod-dynamic varnish_1719685879.ddir(pipedream.changelog.com:80) Results: 1719687145.378785 0.000083 0.000083
+         0 Timestamp      - vmod-dynamic varnish_1719685879.ddir(pipedream.changelog.com:80) Update: 1719687145.378818 0.000116 0.000032
+```
+
+After getting some kind of messy VCL config that I somehow cobbled together, it seems to maybe work, and I found the backend.list is a bit different now with the dynamic backends:
+```
+varnish@248b1522cf92:/etc/varnish$  varnishadm backend.list
+Backend name                                            Admin    Probe  Health   Last change
+varnish_1719686569.default                              healthy  0/0    healthy  Sat, 29 Jun 2024 18:42:49 GMT
+varnish_1719686569.ddir(pipedream.changelog.com:(null)) probe    1/1    healthy  Sat, 29 Jun 2024 18:43:10 GMT
+varnish_1719686569.ddir(188.93.149.98:http)             probe    10/10  healthy  Sat, 29 Jun 2024 18:43:11 GMT
+```
+
+Something interesting I think I noticed was that immediately following a reloading the VCL configs there wouldn't be any backends listed. 
+```
+Backend name               Admin    Probe  Health   Last change
+varnish_1719687477.default healthy  0/0    healthy  Sat, 29 Jun 2024 18:57:57 GMT
+```
+My first request to varnish after the VCL reload would kick off the additional ddir() entries in the backend list and the probe for the IP would start being made. In the `varnishlog` I saw the `ReReq` on that first request would show up with a fetch failure that seemed to imply the specific backend was unhealthy.
+```
+-   FetchError     backend ddir(188.93.149.98:80): unhealthy
+```
+checking the backend list shortly after I could see that it had only completed a few of the probes:
+```
+Backend name                                            Admin    Probe  Health   Last change
+varnish_1719687477.default                              healthy  0/0    healthy  Sat, 29 Jun 2024 18:57:57 GMT
+varnish_1719687477.ddir(pipedream.changelog.com:(null)) probe    1/1    healthy  Sat, 29 Jun 2024 18:58:14 GMT
+varnish_1719687477.ddir(188.93.149.98:80)               probe    5/10   healthy  Sat, 29 Jun 2024 18:58:14 GMT
+```
+I'm not sure if because I have a probe defined on the backend that the first attempt to it ends up resulting in an unheathy backend because it's dynamically creating the backend during that same request or why exactly it seems to fail, but I thought that was a bit odd. Because I already had a cached object it ended up serving stale content from the cache and after a few seconds was getting successful backend fetches.
+```
+-   BackendOpen    32 ddir(188.93.149.98:80) 188.93.149.98 80 172.17.0.2 50546 connect
+```
+
+I don't feel confident that I know what I'm doing here, but I think it's working... 🤷

@@ -2,23 +2,49 @@
 vcl 4.1;
 
 import std;
+import dynamic;
+
+# workaround for my lack of ipv6 support
+acl ipv4_only { "0.0.0.0"/0; }
+
 
 # Thanks Matt Johnson! 👋
 # - https://github.com/magento/magento2/blob/03621bbcd75cbac4ffa8266a51aa2606980f4830/app/code/Magento/PageCache/etc/varnish6.vcl
 # - https://abhishekjakhotiya.medium.com/magento-internals-cache-purging-and-cache-tags-bf7772e60797
 
+probe backend_probe {
+  .url = "/health";
+  .timeout = 2s;
+  .interval = 5s;
+  .window = 10;
+  .threshold = 5;
+}
+
 backend default {
-  .host = "pipedream.changelog.com";
-  .host_header = "changelog-2024-01-12.fly.dev";
-  .port = "80";
-  .first_byte_timeout = 5s;
-  .probe = {
-    .url = "/health";
-    .timeout = 2s;
-    .interval = 5s;
-    .window = 10;
-    .threshold = 5;
-  }
+  .host = "pipedream.changelog.com"; # I think this needs a valid value but isn't used ?
+  #.host_header = "changelog-2024-01-12.fly.dev";
+  #.port = "80";
+  #.first_byte_timeout = 5s;
+  #.probe = backend_probe
+}
+
+sub vcl_init {
+  new dres = dynamic.resolver();
+  new ddir = dynamic.director(
+    resolver = dres.use(),
+    #ttl_from = dns, # the pipedream.changelog.com DNS ttl was 3600s and I didn't want to wait that long
+    ttl = 10s, # the hostname will be resolved every 60 seconds
+
+    # host = "pipedream.changelog.com", # host is defined in vcl_recv call to ddir.backend()
+    host_header = "changelog-2024-01-12.fly.dev",
+    port = "80",
+    first_byte_timeout = 5s,
+    probe = backend_probe,
+
+    # workaround for my lack of ipv6 support
+    whitelist = ipv4_only,
+
+    );
 }
 
 # https://varnish-cache.org/docs/7.4/users-guide/vcl-grace.html
@@ -76,6 +102,9 @@ sub vcl_recv {
             return(synth(400, std.ban_error()));
     }
   }
+
+  # use dynamic backend
+  set req.backend_hint = ddir.backend("pipedream.changelog.com");
 
   # Implement a Varnish health-check
   if (req.method == "GET" && req.url == "/varnish_status") {
