@@ -49,6 +49,11 @@ varnishadm vcl.load varnish_$TIME /etc/varnish/default.vcl
 varnishadm vcl.use varnish_$TIME
 ```
 
+A refresh might also be possible using:
+```bash
+docker exec cdn-2024-01-26 varnishreload
+```
+
 This allows you to easily tweak the VCL and try stuff while keeping the cached objects intact.
 
 You can view the list of VCL configs loaded:
